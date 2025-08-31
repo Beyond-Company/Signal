@@ -172,9 +172,9 @@ def fetch_tenders():
         raise Exception(f"Failed to establish connection with Etimad server: {str(e)}. Please try again later.")
 
     now = datetime.now()
-    # Fetch tenders from the last 30 days to include recent and upcoming tenders
-    thirty_days_ago = now - timedelta(days=30)
-    stop_fetching = False  # Flag to stop fetching when tenders older than 30 days are found
+    # Fetch tenders from the last 24 hours to include recent and upcoming tenders
+    twenty_four_hours_ago = now - timedelta(hours=24)
+    stop_fetching = False  # Flag to stop fetching when tenders older than 24 hours are found
 
     while not stop_fetching:
         retry_count = 0
@@ -245,12 +245,12 @@ def fetch_tenders():
                     time.sleep(2)
                     continue
 
-                # Filter tenders by submission date (within last 30 days)
+                # Filter tenders by submission date (within last 24 hours)
                 valid_count = 0
                 for tender in tenders:
                     try:
                         submission_date = datetime.strptime(tender['submitionDate'].split('.')[0], "%Y-%m-%dT%H:%M:%S")
-                        if submission_date >= thirty_days_ago:  # Only include tenders within the last 30 days
+                        if submission_date >= twenty_four_hours_ago:  # Only include tenders within the last 24 hours
                             valid_tenders.append(tender)
                             valid_count += 1
                         else:
@@ -315,8 +315,8 @@ def fetch_tenders():
 def filter_tenders(tenders, search_criteria):
     filtered_tenders = []
     now = datetime.now()
-    # Include tenders from the last 60 days to capture more relevant results
-    sixty_days_ago = now - timedelta(days=60)
+    # Include tenders from the last 24 hours to capture more relevant results
+    twenty_four_hours_ago = now - timedelta(hours=24)
 
     # Log the search criteria for debugging
     print(f"Search Criteria: {search_criteria}")
@@ -325,8 +325,8 @@ def filter_tenders(tenders, search_criteria):
         submission_date_str = tender['submitionDate'].split('.')[0]
         submission_date = datetime.strptime(submission_date_str, "%Y-%m-%dT%H:%M:%S")
 
-        # Skip tenders older than 60 days
-        if submission_date < sixty_days_ago:
+        # Skip tenders older than 24 hours
+        if submission_date < twenty_four_hours_ago:
             continue
 
         # Initialize matching flags
@@ -1053,7 +1053,7 @@ def start_scheduler():
             logger.error(f"Database health check job failed: {health_error}")
 
     # Add the main scheduled job (daily at 11:51 AM)
-    main_trigger = CronTrigger(hour=12, minute=33, timezone=timezone)
+    main_trigger = CronTrigger(hour=11, minute=34, timezone=timezone)
     scheduler.add_job(
         func=debug_job,
         trigger=main_trigger,
