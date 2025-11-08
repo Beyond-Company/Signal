@@ -8,6 +8,7 @@ from sqlalchemy import text
 
 import json
 import os
+import random
 from dotenv import load_dotenv
 import time
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
@@ -36,6 +37,14 @@ POSTMARK_API_KEY = os.getenv('POSTMARK_API_KEY')
 
 # Global variable to track the current processing page
 current_page = 0
+
+# Etimad fetch tuning – keep values conservative and override via env vars if needed
+MAX_FETCH_PAGES = int(os.getenv("ETIMAD_MAX_PAGES", 8))
+MAX_FETCH_RUNTIME_SECONDS = int(os.getenv("ETIMAD_MAX_RUNTIME_SECONDS", 420))
+BASE_PAGE_DELAY_SECONDS = float(os.getenv("ETIMAD_BASE_DELAY_SECONDS", 4.0))
+MAX_BACKOFF_SECONDS = float(os.getenv("ETIMAD_MAX_BACKOFF_SECONDS", 180.0))
+HTML_BLOCK_RETRIES = int(os.getenv("ETIMAD_HTML_BLOCK_RETRIES", 2))
+
 
 def check_database_health():
     """Check database connection health and attempt recovery if needed"""
@@ -175,8 +184,29 @@ def fetch_tenders():
     # Fetch tenders from the last 24 hours to include recent and upcoming tenders
     twenty_four_hours_ago = now - timedelta(hours=24)
     stop_fetching = False  # Flag to stop fetching when tenders older than 24 hours are found
+    pages_fetched = 0
+    start_time = time.time()
+    backoff_delay = BASE_PAGE_DELAY_SECONDS
+    html_block_count = 0
+    early_exit_reason = None
+
+    def get_page_delay(multiplier: float = 1.0) -> float:
+        """Return a randomized per-page delay with jitter."""
+        jitter = random.uniform(0.6, 1.4)
+        return max(1.0, BASE_PAGE_DELAY_SECONDS * multiplier * jitter)
 
     while not stop_fetching:
+        if pages_fetched >= MAX_FETCH_PAGES:
+            early_exit_reason = f"Max page limit reached ({MAX_FETCH_PAGES})"
+            print(f"[{datetime.now()}] {early_exit_reason}. Stopping fetch run.")
+            break
+
+        elapsed = time.time() - start_time
+        if elapsed >= MAX_FETCH_RUNTIME_SECONDS:
+            early_exit_reason = f"Max runtime limit reached ({MAX_FETCH_RUNTIME_SECONDS}s)"
+            print(f"[{datetime.now()}] {early_exit_reason}. Stopping fetch run.")
+            break
+
         retry_count = 0
         success = False
 
@@ -236,12 +266,21 @@ def fetch_tenders():
                     # If we get HTML instead of JSON, it might be a rate limit or bot detection
                     if response.status_code == 200 and 'text/html' in response.headers.get('content-type', ''):
                         print(f"[{datetime.now()}] ⚠️ Received HTML instead of JSON - possible rate limiting or bot detection")
-                        print(f"[{datetime.now()}] Waiting 60 seconds before retry...")
-                        time.sleep(60)  # Wait 60 seconds
+                        html_block_count += 1
+                        if html_block_count > HTML_BLOCK_RETRIES:
+                            early_exit_reason = f"HTML block limit reached ({HTML_BLOCK_RETRIES})"
+                            print(f"[{datetime.now()}] {early_exit_reason}. Aborting fetch loop early.")
+                            stop_fetching = True
+                            break
+                        backoff_delay = min(backoff_delay * 2, MAX_BACKOFF_SECONDS)
+                        delay = get_page_delay(backoff_delay / BASE_PAGE_DELAY_SECONDS)
+                        print(f"[{datetime.now()}] Waiting {delay:.1f} seconds before retry (backoff).")
+                        time.sleep(delay)
                         retry_count += 1
                         continue
                     
                     retry_count += 1
+                    backoff_delay = min(backoff_delay * 1.5, MAX_BACKOFF_SECONDS)
                     time.sleep(2)
                     continue
 
@@ -256,6 +295,8 @@ def fetch_tenders():
                         else:
                             print(f"[{datetime.now()}] Stopping at older tender: {tender.get('tenderName', 'Unknown')} - Date: {submission_date}")
                             stop_fetching = True  # Stop fetching if we encounter an older tender
+                            if not early_exit_reason:
+                                early_exit_reason = "Encountered tender older than 24 hours"
                             break  # Exit the loop early since all subsequent tenders will be older
                     except (KeyError, ValueError) as date_error:
                         print(f"[{datetime.now()}] Error parsing date for tender {tender.get('tenderId', 'Unknown')}: {date_error}")
@@ -267,6 +308,9 @@ def fetch_tenders():
 
                 success = True
                 current_page = page_number  # Update the global page number
+                pages_fetched += 1
+                html_block_count = 0
+                backoff_delay = BASE_PAGE_DELAY_SECONDS
                 break
 
             except requests.exceptions.RequestException as e:
@@ -278,15 +322,17 @@ def fetch_tenders():
                     status_code = e.response.status_code
                     if status_code == 429:
                         print(f"[{datetime.now()}] Rate limited by Etimad server. Waiting 60 seconds...")
-                        time.sleep(60)
+                        backoff_delay = min(backoff_delay * 2, MAX_BACKOFF_SECONDS)
+                        time.sleep(get_page_delay(backoff_delay / BASE_PAGE_DELAY_SECONDS))
                     elif status_code in [503, 502, 500]:
                         print(f"[{datetime.now()}] Etimad server error {status_code}. Waiting 30 seconds...")
-                        time.sleep(30)
+                        time.sleep(get_page_delay(2.0))
                     elif status_code == 403:
                         print(f"[{datetime.now()}] Access forbidden by Etimad server. Waiting 120 seconds...")
-                        time.sleep(120)
+                        backoff_delay = min(backoff_delay * 2.5, MAX_BACKOFF_SECONDS)
+                        time.sleep(get_page_delay(backoff_delay / BASE_PAGE_DELAY_SECONDS))
                     else:
-                        time.sleep(2)  # Default wait time
+                        time.sleep(get_page_delay(0.8))  # Default wait time
                 else:
                     time.sleep(2)  # Default wait time
                 
@@ -302,10 +348,17 @@ def fetch_tenders():
         if success and not stop_fetching:
             page_number += 1
             # Add longer delay between pages to avoid bot detection
-            print(f"[{datetime.now()}] ⏳ Waiting 30 seconds before fetching next page...")
-            time.sleep(30)  # Wait 30 seconds between pages
+            delay = get_page_delay()
+            print(f"[{datetime.now()}] ⏳ Waiting {delay:.1f} seconds before fetching next page...")
+            time.sleep(delay)
         else:
             break  # Stop fetching if retries are exhausted or there are no tenders
+
+    total_elapsed = time.time() - start_time
+    if early_exit_reason:
+        print(f"[{datetime.now()}] Fetch run completed early: {early_exit_reason}. Pages fetched: {pages_fetched}, tenders collected: {len(valid_tenders)}, elapsed: {total_elapsed:.1f}s")
+    else:
+        print(f"[{datetime.now()}] Fetch run completed. Pages fetched: {pages_fetched}, tenders collected: {len(valid_tenders)}, elapsed: {total_elapsed:.1f}s")
 
     current_page = 0  # Reset page number after processing
     log_memory_usage("Fetch Tenders.")
